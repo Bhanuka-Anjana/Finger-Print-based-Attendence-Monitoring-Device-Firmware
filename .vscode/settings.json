@@ -1,0 +1,9 @@
+{
+  "C_Cpp.errorSquiggles": "disabled",
+  "files.associations": {
+    "*.ejs": "html",
+    "functional": "cpp"
+  },
+  "idf.portWin": "COM3",
+  "idf.flashType": "UART"
+}
