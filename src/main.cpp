@@ -22,7 +22,7 @@ volatile int selectedMenuOption = 0;
 const int menuControlBtn = 12;
 const int menuItemSelectBtn = 13;
 // array for menu items
-const char *menuItems[] = {"connect server", "reset wifi", "sleep device"};
+const char *menuItems[] = {"connect server", "reset wifi"};
 
 // WiFi settings
 const char *ssid = "ESP32-AP";
@@ -31,9 +31,10 @@ const char *configFile = "/config.json";
 
 WebServer server(80);
 bool APStarted = false;
+bool wifiConnected = false;
 
 // Function prototypes
-void taskUpdateCellData(void *parameter);
+void taskUpdateBatteryCellData(void *parameter);
 void taskWiFiConnection(void *parameter);
 void taskDisplayUpdate(void *parameter);
 void taskEnableAPMode(void *parameter);
@@ -97,7 +98,7 @@ void setup()
   display.clearDisplay();
 
   // Create tasks
-  xTaskCreatePinnedToCore(taskUpdateCellData, "CellPercentage", 2048, NULL, 3, &taskHandleCellPercentage, CONFIG_ARDUINO_RUNNING_CORE);
+  xTaskCreatePinnedToCore(taskUpdateBatteryCellData, "CellPercentage", 2048, NULL, 3, &taskHandleCellPercentage, CONFIG_ARDUINO_RUNNING_CORE);
   xTaskCreatePinnedToCore(taskWiFiConnection, "WiFiConnection", 2048, NULL, 2, &taskHandleWiFiConnection, CONFIG_ARDUINO_RUNNING_CORE);
   xTaskCreatePinnedToCore(taskDisplayUpdate, "DisplayUpdate", 2048, NULL, 1, NULL, CONFIG_ARDUINO_RUNNING_CORE);
   // xTaskCreatePinnedToCore(taskEnableAPMode, "EnableAPMode", 4096, NULL, 2, &taskHandleEnableAPMode, CONFIG_ARDUINO_RUNNING_CORE);
@@ -106,13 +107,16 @@ void loop()
 {
   // Not used in FreeRTOS
 }
-void taskUpdateCellData(void *parameter)
+void taskUpdateBatteryCellData(void *parameter)
 {
   while (true)
   {
     // Read battery percentage from MAX17043
+    lipo.wake();
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
     cellPercentage = lipo.getSOC();
     lowBattery = lipo.getAlert();
+    lipo.sleep();
     vTaskDelay(10000 / portTICK_PERIOD_MS);
   }
 }
@@ -124,8 +128,10 @@ void taskWiFiConnection(void *parameter)
     if (WiFi.status() != WL_CONNECTED)
     {
       // Attempt to connect using stored credentials
+      wifiConnected = false;
       connectToStoredWiFi();
     }
+    wifiConnected = true;
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
@@ -133,93 +139,63 @@ void taskDisplayUpdate(void *parameter)
 {
   while (true)
   {
-    // check wifi status
-    if (WiFi.status() == WL_CONNECTED)
+    display.clearDisplay();
+
+    if (!APStarted)
     {
-      // Display battery percentage
-      display.clearDisplay();
       display.setTextSize(1);
       display.setTextColor(SSD1306_WHITE);
       display.setCursor(0, 0);
-
-      if (lowBattery)
+      if (wifiConnected)
       {
-        display.println("Wifi | Low Battery!");
-        // display menu
-        // Update display menu using button interrupts
-        display.setCursor(0, 10);
-        for (int i = 0; i < 3; i++)
-        {
-          if (selectedMenuOption == i)
-          {
-            display.print(">");
-          }
-          else
-          {
-            display.print(" ");
-          }
-          display.println(menuItems[i]);
-        }
+        display.print("Wifi  |");
       }
       else
       {
-        display.print("Wifi|Battery:");
-        display.print(cellPercentage);
-        display.println("%");
-        // display menu
-        // Update display menu using button interrupts
-        display.setCursor(0, 10);
-        for (int i = 0; i < 3; i++)
-        {
-          if (selectedMenuOption == i)
-          {
-            display.print(">");
-          }
-          else
-          {
-            display.print(" ");
-          }
-          display.println(menuItems[i]);
-        }
+        display.print("No Wifi|");
       }
+      display.print(" Bat:");
+      display.print(cellPercentage);
+      display.print("%");
 
-      display.display();
-      continue;
+      display.setCursor(0, 10);
+      for (int i = 0; i < sizeof(menuItems); i++)
+      {
+        if (selectedMenuOption == i)
+        {
+          display.print(">");
+        }
+        else
+        {
+          display.print(" ");
+        }
+        display.println(menuItems[i]);
+      }
     }
     else
     {
-      if (APStarted)
-      {
-        display.clearDisplay();
-        display.setTextSize(1);
-        display.setTextColor(SSD1306_WHITE);
-        display.setCursor(0, 0);
-        display.println("Access Point Mode");
-        // display ip address
-        display.setCursor(0, 10);
-        display.println(WiFi.softAPIP().toString());  
-        display.display();
-      }
-      else
-      {
-        display.clearDisplay();
-        display.setTextSize(1);
-        display.setTextColor(SSD1306_WHITE);
-        display.setCursor(0, 0);
-        display.println("Connecting to WiFi...");
-        // display SSID
-        display.setCursor(0, 10);
-        display.println(WiFi.SSID());
-        display.display();
-      }
+      display.setTextSize(1);
+      display.setTextColor(SSD1306_WHITE);
+      display.setCursor(0, 0);
+      display.print(" Bat:");
+      display.print(cellPercentage);
+      display.print("%");
+      display.setCursor(0, 10);
+      display.println("Access Point Mode");
+      // display ip address
+      display.setCursor(0, 20);
+      display.println(WiFi.softAPIP().toString());
     }
-    vTaskDelay(100 / portTICK_PERIOD_MS);
+    display.display();
+    continue;
   }
 }
+
 void taskEnableAPMode(void *parameter)
 {
   vTaskSuspend(taskHandleWiFiConnection);
   APStarted = true;
+  wifiConnected = false;
   resetWiFiConfig();
   // Set ESP32 as an access point
   WiFi.softAP(ssid, password);
@@ -303,7 +279,7 @@ void handleRoot()
   html += "<input type='submit'></form></body></html>";
   server.send(200, "text/html", html);
 }
-void handleSave() 
+void handleSave()
 {
   String ssid = server.arg("ssid");
   String password = server.arg("password");
