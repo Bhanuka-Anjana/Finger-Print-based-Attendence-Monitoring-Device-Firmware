@@ -6,6 +6,9 @@
 #include <SPIFFS.h>
 #include <ArduinoJson.h>
 #include <SparkFun_MAX1704x_Fuel_Gauge_Arduino_Library.h>
+#include <WebSocketsClient.h>
+#include <Adafruit_Fingerprint.h>
+#include <HardwareSerial.h>
 
 // Create fuel gauge object
 SFE_MAX1704X lipo(MAX1704X_MAX17043);
@@ -22,22 +25,32 @@ volatile int selectedMenuOption = 0;
 const int menuControlBtn = 12;
 const int menuItemSelectBtn = 13;
 // array for menu items
-const char *menuItems[] = {"connect server", "reset wifi"};
+const char *menuItems[] = {"connect server", "reset wifi", "mark attendance"};
 
 // WiFi settings
 const char *ssid = "ESP32-AP";
 const char *password = "password";
 const char *configFile = "/config.json";
+const char *websockets_server_host = "192.168.136.135";
+const uint16_t websockets_server_port = 8080;
 
 WebServer server(80);
+WebSocketsClient webSocket;
 bool APStarted = false;
 bool wifiConnected = false;
+bool webSocketConnected = false;
+bool fingerprintSensorisWorking = false;
+char *fingerprintSensorDetails;
+
+// Fingerprint sensor settings
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&Serial);
 
 // Function prototypes
 void taskUpdateBatteryCellData(void *parameter);
 void taskWiFiConnection(void *parameter);
 void taskDisplayUpdate(void *parameter);
 void taskEnableAPMode(void *parameter);
+void taskStartWebSocketClient(void *parameter);
 void menuControlInterrupt();
 void menuSelectInterrupt();
 bool connectToStoredWiFi();
@@ -46,18 +59,25 @@ void handleRoot();
 void handleSave();
 String getAvailableNetworks();
 void resetWiFiConfig();
+void webSocketEvent(WStype_t type, uint8_t *payload, size_t length);
+void markAttendance();
+void sendFingerprintId(uint16_t id, const char *action);
+void enrollFingerprint(uint16_t index);
 
 // Task handles
 TaskHandle_t taskHandleCellPercentage;
 TaskHandle_t taskHandleWiFiConnection;
 TaskHandle_t taskHandleEnableAPMode;
+TaskHandle_t taskHandleStartWebSocketServer;
 
 void setup()
 {
-  Serial.begin(115200);
 
   // Initialize I2C communication
   Wire.begin();
+
+  // Initialize serial communication
+  Serial.begin(115200);
 
   // configure the pin modes
   pinMode(menuControlBtn, INPUT_PULLUP);
@@ -70,7 +90,7 @@ void setup()
   // lipo.enableDebugging();
   if (lipo.begin() == false)
   {
-    Serial.println("MAX17043 not detected. Freezing...");
+    // Serial.println("MAX17043 not detected. Freezing...");
     while (1)
       ;
   }
@@ -81,32 +101,36 @@ void setup()
   // Initialize SPIFFS
   if (!SPIFFS.begin(true))
   {
-    Serial.println("An error occurred while mounting SPIFFS...");
+    // Serial.println("An error occurred while mounting SPIFFS...");
     return;
   }
 
   // Initialize OLED display
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
   {
-    Serial.println(F("SSD1306 allocation failed"));
+    // Serial.println(F("SSD1306 allocation failed"));
     for (;;)
       ;
   }
+  finger.begin(57600);
+  finger.verifyPassword();
 
   display.display();
   delay(2000);
   display.clearDisplay();
 
   // Create tasks
-  xTaskCreatePinnedToCore(taskUpdateBatteryCellData, "CellPercentage", 2048, NULL, 3, &taskHandleCellPercentage, CONFIG_ARDUINO_RUNNING_CORE);
-  xTaskCreatePinnedToCore(taskWiFiConnection, "WiFiConnection", 2048, NULL, 2, &taskHandleWiFiConnection, CONFIG_ARDUINO_RUNNING_CORE);
-  xTaskCreatePinnedToCore(taskDisplayUpdate, "DisplayUpdate", 2048, NULL, 1, NULL, CONFIG_ARDUINO_RUNNING_CORE);
+  xTaskCreate(taskUpdateBatteryCellData, "CellPercentage", 2048, NULL, 1, &taskHandleCellPercentage);
+  xTaskCreate(taskWiFiConnection, "WiFiConnection", 4096, NULL, 3, &taskHandleWiFiConnection);
+  xTaskCreate(taskDisplayUpdate, "DisplayUpdate", 2048, NULL, 1, NULL);
   // xTaskCreatePinnedToCore(taskEnableAPMode, "EnableAPMode", 4096, NULL, 2, &taskHandleEnableAPMode, CONFIG_ARDUINO_RUNNING_CORE);
 }
+
 void loop()
 {
   // Not used in FreeRTOS
 }
+
 void taskUpdateBatteryCellData(void *parameter)
 {
   while (true)
@@ -120,6 +144,7 @@ void taskUpdateBatteryCellData(void *parameter)
     vTaskDelay(10000 / portTICK_PERIOD_MS);
   }
 }
+
 void taskWiFiConnection(void *parameter)
 {
   while (true)
@@ -129,12 +154,29 @@ void taskWiFiConnection(void *parameter)
     {
       // Attempt to connect using stored credentials
       wifiConnected = false;
-      connectToStoredWiFi();
+      if (!APStarted)
+      {
+        File file = SPIFFS.open(configFile, FILE_READ);
+
+        // Parse JSON from file
+        DynamicJsonDocument doc(1024);
+        deserializeJson(doc, file);
+
+        const char *ssid = doc["ssid"];
+        const char *password = doc["password"];
+
+        file.close();
+
+        // Serial.println("Connecting to stored WiFi...");
+
+        WiFi.begin(ssid, password);
+      }
     }
     wifiConnected = true;
-    vTaskDelay(1000 / portTICK_PERIOD_MS);
+    vTaskDelay(500 / portTICK_PERIOD_MS);
   }
 }
+
 void taskDisplayUpdate(void *parameter)
 {
   while (true)
@@ -159,7 +201,7 @@ void taskDisplayUpdate(void *parameter)
       display.print("%");
 
       display.setCursor(0, 10);
-      for (int i = 0; i < sizeof(menuItems); i++)
+      for (int i = 0; i < 3; i++)
       {
         if (selectedMenuOption == i)
         {
@@ -170,6 +212,11 @@ void taskDisplayUpdate(void *parameter)
           display.print(" ");
         }
         display.println(menuItems[i]);
+      }
+      if (fingerprintSensorisWorking)
+      {
+        display.setCursor(0, 20);
+        display.println(fingerprintSensorDetails);
       }
     }
     else
@@ -187,13 +234,12 @@ void taskDisplayUpdate(void *parameter)
       display.println(WiFi.softAPIP().toString());
     }
     display.display();
-    continue;
+    vTaskDelay(100 / portTICK_PERIOD_MS);
   }
 }
 
 void taskEnableAPMode(void *parameter)
 {
-  vTaskSuspend(taskHandleWiFiConnection);
   APStarted = true;
   wifiConnected = false;
   resetWiFiConfig();
@@ -204,70 +250,14 @@ void taskEnableAPMode(void *parameter)
   server.on("/save", HTTP_POST, handleSave);
   server.begin();
 
-  Serial.println("Access Point started");
-  while (true)
+  // Serial.println("Access Point started");
+  while (APStarted)
   {
     server.handleClient();
     vTaskDelay(1000 / portTICK_PERIOD_MS);
   }
 }
-bool connectToStoredWiFi()
-{
-  // Open the file for reading
-  File file = SPIFFS.open(configFile, FILE_READ);
-  if (!file)
-  {
-    Serial.println("Failed to open file for reading");
-    return false;
-  }
 
-  // Parse JSON from file
-  DynamicJsonDocument doc(1024);
-  DeserializationError error = deserializeJson(doc, file);
-  if (error)
-  {
-    Serial.println("Failed to read from file");
-    return false;
-  }
-
-  const char *ssid = doc["ssid"];
-  const char *password = doc["password"];
-
-  file.close();
-
-  Serial.println("Connecting to stored WiFi...");
-
-  WiFi.begin(ssid, password);
-
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(1000);
-    Serial.println("Connecting to WiFi...");
-    attempts++;
-    if (attempts > 10)
-    {
-      Serial.println("Failed to connect to stored WiFi");
-      return false;
-    }
-  }
-
-  Serial.println("Connected to stored WiFi");
-  Serial.println("IP Address: " + WiFi.localIP().toString());
-
-  // Display message
-  display.clearDisplay();
-  display.setTextSize(1);
-  display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);
-  display.println("Connected to WiFi");
-  display.setCursor(0, 10);
-  display.println("IP Address:");
-  display.println(WiFi.localIP().toString());
-  display.display();
-
-  return true;
-}
 void handleRoot()
 {
   String ssidList = getAvailableNetworks();
@@ -279,6 +269,7 @@ void handleRoot()
   html += "<input type='submit'></form></body></html>";
   server.send(200, "text/html", html);
 }
+
 void handleSave()
 {
   String ssid = server.arg("ssid");
@@ -291,16 +282,11 @@ void handleSave()
 
   // Open the file for writing
   File file = SPIFFS.open(configFile, FILE_WRITE);
-  if (!file)
-  {
-    Serial.println("Failed to open file for writing");
-    return;
-  }
 
   // Serialize JSON to file
   if (serializeJson(doc, file) == 0)
   {
-    Serial.println("Failed to write to file");
+    // Serial.println("Failed to write to file");
   }
 
   file.close();
@@ -309,9 +295,11 @@ void handleSave()
 
   delay(2000);
   server.close();
-  // Connect to WiFi using the provided credentials
-  connectToWiFi(ssid.c_str(), password.c_str());
+
+  APStarted = false;
+  // Serial.println("Access Point stopped");
 }
+
 String getAvailableNetworks()
 {
   String ssidList;
@@ -322,6 +310,20 @@ String getAvailableNetworks()
   }
   return ssidList;
 }
+
+void resetWiFiConfig()
+{
+  // Delete the WiFi config file
+  if (SPIFFS.remove(configFile))
+  {
+    // Serial.println("WiFi config file deleted successfully");
+  }
+  else
+  {
+    // Serial.println("Failed to delete WiFi config file");
+  }
+}
+
 void menuControlInterrupt()
 {
   selectedMenuOption--;
@@ -330,57 +332,226 @@ void menuControlInterrupt()
     selectedMenuOption = 2; // Wrap around to last option
   }
 }
+
+void taskStartWebSocketClient(void *parameter)
+{
+  // Serial.println("Starting WebSocket client...");
+  webSocket.begin(websockets_server_host, websockets_server_port, "/");
+  webSocket.onEvent(webSocketEvent);
+  webSocketConnected = true;
+  menuItems[0] = "disconnect server";
+
+  while (true)
+  {
+    if (!wifiConnected)
+    {
+      webSocket.disconnect();
+      webSocketConnected = false;
+      menuItems[0] = "connect server";
+      break;
+    }
+    webSocket.loop();
+  }
+}
+
 void menuSelectInterrupt()
 {
   switch (selectedMenuOption)
   {
   case 0:
-    // Connect to server
+    // Connect to web socket server
+    if (webSocketConnected)
+    {
+      webSocket.disconnect();
+      webSocketConnected = false;
+      menuItems[0] = "connect server";
+    }
+    else
+    {
+      xTaskCreate(taskStartWebSocketClient, "WebSocketServer", 4096, NULL, 2, &taskHandleStartWebSocketServer);
+    }
     break;
   case 1:
     // Enable the APMode task
-    xTaskCreatePinnedToCore(taskEnableAPMode, "EnableAPMode", 4096, NULL, 2, &taskHandleEnableAPMode, CONFIG_ARDUINO_RUNNING_CORE);
+    xTaskCreate(taskEnableAPMode, "EnableAPMode", 8000, NULL, 2, &taskHandleEnableAPMode);
     break;
   case 2:
-    // Sleep device
+    markAttendance();
     break;
   }
 }
-void resetWiFiConfig()
+
+void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 {
-  // Delete the WiFi config file
-  if (SPIFFS.remove(configFile))
+  switch (type)
   {
-    Serial.println("WiFi config file deleted successfully");
+  case WStype_TEXT:
+  {
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc, payload);
+    const char *action = doc["action"];
+    if (strcmp(action, "enroll") == 0)
+    {
+      uint16_t id = doc["id"];
+      enrollFingerprint(id);
+    }
+    break;
+  }
+
+  default:
+    break;
+  }
+}
+
+void markAttendance()
+{
+  if (!finger.verifyPassword())
+  {
+    return;
+  }
+  fingerprintSensorisWorking = true;
+  while (true)
+  {
+    uint8_t p = finger.getImage();
+    if (p != FINGERPRINT_OK)
+    {
+      fingerprintSensorDetails = "No finger detected";
+      continue;
+    }
+
+    p = finger.image2Tz();
+    if (p != FINGERPRINT_OK)
+    {
+      fingerprintSensorDetails = "Error converting image";
+      continue;
+    }
+
+    p = finger.fingerFastSearch();
+    if (p != FINGERPRINT_OK)
+    {
+      fingerprintSensorDetails = "No match found";
+      continue;
+    }
+
+    // found a match!
+    if (finger.confidence < 100)
+    {
+      fingerprintSensorDetails = "Low confidence";
+      continue;
+    }
+    // send attendance to server
+    fingerprintSensorisWorking = false;
+    sendFingerprintId(finger.fingerID, "attendance");
+  }
+}
+
+void sendFingerprintId(uint16_t id, const char *action)
+{
+  DynamicJsonDocument doc(1024);
+  doc[action] = id;
+  String jsonString;
+  serializeJson(doc, jsonString);
+  webSocket.sendTXT(jsonString);
+}
+
+void enrollFingerprint(uint16_t index)
+{
+  if (!finger.verifyPassword())
+  {
+    return;
+  }
+  fingerprintSensorisWorking = true;
+  fingerprintSensorDetails = "Place finger";
+  int p = -1;
+  while (p != FINGERPRINT_OK)
+  {
+    p = finger.getImage();
+    switch (p)
+    {
+    case FINGERPRINT_OK:
+      fingerprintSensorDetails = "Image taken";
+      break;
+    case FINGERPRINT_NOFINGER:
+      fingerprintSensorDetails = "No finger detected";
+      break;
+    case FINGERPRINT_PACKETRECIEVEERR:
+      fingerprintSensorDetails = "Communication error";
+      break;
+    case FINGERPRINT_IMAGEFAIL:
+      fingerprintSensorDetails = "Imaging error";
+      break;
+    default:
+      fingerprintSensorDetails = "Unknown error";
+      break;
+    }
+    delay(500);
+  }
+
+  p = finger.image2Tz(1);
+  if (p != FINGERPRINT_OK)
+  {
+    fingerprintSensorDetails = "Error converting image";
+    return;
+  }
+
+  fingerprintSensorDetails = "Place same finger again";
+  delay(2000);
+
+  p = -1;
+  while (p != FINGERPRINT_NOFINGER)
+  {
+    p = finger.getImage();
+    delay(500);
+  }
+
+  p = -1;
+  while (p != FINGERPRINT_OK)
+  {
+    p = finger.getImage();
+    switch (p)
+    {
+    case FINGERPRINT_OK:
+      fingerprintSensorDetails = "Image taken";
+      break;
+    case FINGERPRINT_NOFINGER:
+      fingerprintSensorDetails = "No finger detected";
+      break;
+    case FINGERPRINT_PACKETRECIEVEERR:
+      fingerprintSensorDetails = "Communication error";
+      break;
+    case FINGERPRINT_IMAGEFAIL:
+      fingerprintSensorDetails = "Imaging error";
+      break;
+    default:
+      fingerprintSensorDetails = "Unknown error";
+      break;
+    }
+    delay(500);
+  }
+
+  p = finger.image2Tz(2);
+  if (p != FINGERPRINT_OK)
+  {
+    fingerprintSensorDetails = "Error converting image";
+    return;
+  }
+
+  p = finger.createModel();
+  if (p != FINGERPRINT_OK)
+  {
+    fingerprintSensorDetails = "Error creating model";
+    return;
+  }
+
+  p = finger.storeModel(index);
+  if (p == FINGERPRINT_OK)
+  {
+    fingerprintSensorDetails = "Fingerprint stored";
+    sendFingerprintId(index, "enroll_confirm");
   }
   else
   {
-    Serial.println("Failed to delete WiFi config file");
+    fingerprintSensorDetails = "Error storing fingerprint";
   }
-}
-void connectToWiFi(const char *ssid, const char *password)
-{
-
-  Serial.println("Connecting to WiFi...");
-  WiFi.begin(ssid, password);
-
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED)
-  {
-    delay(1000);
-    Serial.println("Connecting to WiFi...");
-    attempts++;
-    if (attempts > 10)
-    {
-      Serial.println("Failed to connect to WiFi");
-      return;
-    }
-  }
-
-  APStarted = false;
-  Serial.println("Connected to WiFi");
-  Serial.println("IP Address: " + WiFi.localIP().toString());
-  // resume the WiFi connection task and delete the APmode task
-  vTaskDelete(taskHandleEnableAPMode);
-  vTaskResume(taskHandleWiFiConnection);
+  fingerprintSensorisWorking = false;
 }
