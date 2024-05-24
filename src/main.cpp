@@ -40,10 +40,9 @@ bool APStarted = false;
 bool wifiConnected = false;
 bool webSocketConnected = false;
 bool fingerprintSensorisWorking = false;
-char *fingerprintSensorDetails;
 
 // Fingerprint sensor settings
-Adafruit_Fingerprint finger = Adafruit_Fingerprint(&Serial);
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&Serial2);
 
 // Function prototypes
 void taskUpdateBatteryCellData(void *parameter);
@@ -51,6 +50,8 @@ void taskWiFiConnection(void *parameter);
 void taskDisplayUpdate(void *parameter);
 void taskEnableAPMode(void *parameter);
 void taskStartWebSocketClient(void *parameter);
+void taskMarkAttendance(void *parameter);
+void taskRegisterFingerprint(void *parameter);
 void menuControlInterrupt();
 void menuSelectInterrupt();
 bool connectToStoredWiFi();
@@ -60,15 +61,14 @@ void handleSave();
 String getAvailableNetworks();
 void resetWiFiConfig();
 void webSocketEvent(WStype_t type, uint8_t *payload, size_t length);
-void markAttendance();
 void sendFingerprintId(uint16_t id, const char *action);
-void enrollFingerprint(uint16_t index);
 
 // Task handles
 TaskHandle_t taskHandleCellPercentage;
 TaskHandle_t taskHandleWiFiConnection;
 TaskHandle_t taskHandleEnableAPMode;
 TaskHandle_t taskHandleStartWebSocketServer;
+TaskHandle_t taskHandleMarkAttendance;
 
 void setup()
 {
@@ -77,7 +77,7 @@ void setup()
   Wire.begin();
 
   // Initialize serial communication
-  Serial.begin(115200);
+  Serial2.begin(115200);
 
   // configure the pin modes
   pinMode(menuControlBtn, INPUT_PULLUP);
@@ -114,15 +114,13 @@ void setup()
   }
   finger.begin(57600);
   finger.verifyPassword();
-
-  display.display();
-  delay(2000);
+  
   display.clearDisplay();
 
   // Create tasks
-  xTaskCreate(taskUpdateBatteryCellData, "CellPercentage", 2048, NULL, 1, &taskHandleCellPercentage);
+  xTaskCreate(taskUpdateBatteryCellData, "CellPercentage", 2048, NULL, 2, &taskHandleCellPercentage);
   xTaskCreate(taskWiFiConnection, "WiFiConnection", 4096, NULL, 3, &taskHandleWiFiConnection);
-  xTaskCreate(taskDisplayUpdate, "DisplayUpdate", 2048, NULL, 1, NULL);
+  xTaskCreate(taskDisplayUpdate, "DisplayUpdate", 2048, NULL, 2, NULL);
   // xTaskCreatePinnedToCore(taskEnableAPMode, "EnableAPMode", 4096, NULL, 2, &taskHandleEnableAPMode, CONFIG_ARDUINO_RUNNING_CORE);
 }
 
@@ -213,11 +211,6 @@ void taskDisplayUpdate(void *parameter)
         }
         display.println(menuItems[i]);
       }
-      if (fingerprintSensorisWorking)
-      {
-        display.setCursor(0, 20);
-        display.println(fingerprintSensorDetails);
-      }
     }
     else
     {
@@ -293,7 +286,6 @@ void handleSave()
 
   server.send(200, "text/html", "<html><body><h1 style='color:green;'>WiFi Credentials Saved Successfully!</h1></body></html>");
 
-  delay(2000);
   server.close();
 
   APStarted = false;
@@ -362,21 +354,31 @@ void menuSelectInterrupt()
     // Connect to web socket server
     if (webSocketConnected)
     {
-      webSocket.disconnect();
+      vTaskDelete(taskHandleStartWebSocketServer);
       webSocketConnected = false;
       menuItems[0] = "connect server";
     }
     else
     {
-      xTaskCreate(taskStartWebSocketClient, "WebSocketServer", 4096, NULL, 2, &taskHandleStartWebSocketServer);
+      xTaskCreate(taskStartWebSocketClient, "WebSocketServer", 4096, NULL, 4, &taskHandleStartWebSocketServer);
     }
     break;
   case 1:
     // Enable the APMode task
-    xTaskCreate(taskEnableAPMode, "EnableAPMode", 8000, NULL, 2, &taskHandleEnableAPMode);
+    xTaskCreate(taskEnableAPMode, "EnableAPMode", 8000, NULL, 4, &taskHandleEnableAPMode);
     break;
   case 2:
-    markAttendance();
+    // Mark attendance
+    if (fingerprintSensorisWorking)
+    {
+      vTaskDelete(taskHandleMarkAttendance);
+      menuItems[2] = "mark attendance";
+      fingerprintSensorisWorking = false;
+    }
+    else
+    {
+      xTaskCreate(taskMarkAttendance, "MarkAttendance", 5000, NULL, 3, &taskHandleMarkAttendance);
+    }
     break;
   }
 }
@@ -392,8 +394,8 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     const char *action = doc["action"];
     if (strcmp(action, "enroll") == 0)
     {
-      uint16_t id = doc["id"];
-      enrollFingerprint(id);
+      int id = doc["id"];
+      xTaskCreate(taskRegisterFingerprint, "RegisterFingerprint", 8000, (void *)id, 4, NULL);
     }
     break;
   }
@@ -403,45 +405,30 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
   }
 }
 
-void markAttendance()
+void taskMarkAttendance(void *parameter)
 {
-  if (!finger.verifyPassword())
-  {
-    return;
-  }
-  fingerprintSensorisWorking = true;
   while (true)
   {
-    uint8_t p = finger.getImage();
-    if (p != FINGERPRINT_OK)
+    fingerprintSensorisWorking = true;
+    menuItems[2] = "stop attendance";
+    int p = finger.getImage();
+    if (p == FINGERPRINT_OK)
     {
-      fingerprintSensorDetails = "No finger detected";
-      continue;
+      p = finger.image2Tz();
+      if (p == FINGERPRINT_OK)
+      {
+        p = finger.fingerFastSearch();
+        if (p == FINGERPRINT_OK)
+        {
+          if (finger.confidence > 50)
+          {
+            sendFingerprintId(finger.fingerID, "attendance");
+          }
+        }
+      }
     }
 
-    p = finger.image2Tz();
-    if (p != FINGERPRINT_OK)
-    {
-      fingerprintSensorDetails = "Error converting image";
-      continue;
-    }
-
-    p = finger.fingerFastSearch();
-    if (p != FINGERPRINT_OK)
-    {
-      fingerprintSensorDetails = "No match found";
-      continue;
-    }
-
-    // found a match!
-    if (finger.confidence < 100)
-    {
-      fingerprintSensorDetails = "Low confidence";
-      continue;
-    }
-    // send attendance to server
-    fingerprintSensorisWorking = false;
-    sendFingerprintId(finger.fingerID, "attendance");
+    vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
 
@@ -454,104 +441,31 @@ void sendFingerprintId(uint16_t id, const char *action)
   webSocket.sendTXT(jsonString);
 }
 
-void enrollFingerprint(uint16_t index)
+void taskRegisterFingerprint(void *parameter)
 {
-  if (!finger.verifyPassword())
+  int id = (int)parameter;
+  while (true)
   {
-    return;
-  }
-  fingerprintSensorisWorking = true;
-  fingerprintSensorDetails = "Place finger";
-  int p = -1;
-  while (p != FINGERPRINT_OK)
-  {
-    p = finger.getImage();
-    switch (p)
+    fingerprintSensorisWorking = true;
+    menuItems[2] = "stop enrollment";
+    int p = finger.getImage();
+    if (p == FINGERPRINT_OK)
     {
-    case FINGERPRINT_OK:
-      fingerprintSensorDetails = "Image taken";
-      break;
-    case FINGERPRINT_NOFINGER:
-      fingerprintSensorDetails = "No finger detected";
-      break;
-    case FINGERPRINT_PACKETRECIEVEERR:
-      fingerprintSensorDetails = "Communication error";
-      break;
-    case FINGERPRINT_IMAGEFAIL:
-      fingerprintSensorDetails = "Imaging error";
-      break;
-    default:
-      fingerprintSensorDetails = "Unknown error";
-      break;
+      p = finger.image2Tz();
+      if (p == FINGERPRINT_OK)
+      {
+        p = finger.createModel();
+        if (p == FINGERPRINT_OK)
+        {
+          p = finger.storeModel(id);
+          if (p == FINGERPRINT_OK)
+          {
+            sendFingerprintId(id, "enroll_confirm");
+            break;
+          }
+        }
+      }
     }
-    delay(500);
+    vTaskDelay(50 / portTICK_PERIOD_MS);
   }
-
-  p = finger.image2Tz(1);
-  if (p != FINGERPRINT_OK)
-  {
-    fingerprintSensorDetails = "Error converting image";
-    return;
-  }
-
-  fingerprintSensorDetails = "Place same finger again";
-  delay(2000);
-
-  p = -1;
-  while (p != FINGERPRINT_NOFINGER)
-  {
-    p = finger.getImage();
-    delay(500);
-  }
-
-  p = -1;
-  while (p != FINGERPRINT_OK)
-  {
-    p = finger.getImage();
-    switch (p)
-    {
-    case FINGERPRINT_OK:
-      fingerprintSensorDetails = "Image taken";
-      break;
-    case FINGERPRINT_NOFINGER:
-      fingerprintSensorDetails = "No finger detected";
-      break;
-    case FINGERPRINT_PACKETRECIEVEERR:
-      fingerprintSensorDetails = "Communication error";
-      break;
-    case FINGERPRINT_IMAGEFAIL:
-      fingerprintSensorDetails = "Imaging error";
-      break;
-    default:
-      fingerprintSensorDetails = "Unknown error";
-      break;
-    }
-    delay(500);
-  }
-
-  p = finger.image2Tz(2);
-  if (p != FINGERPRINT_OK)
-  {
-    fingerprintSensorDetails = "Error converting image";
-    return;
-  }
-
-  p = finger.createModel();
-  if (p != FINGERPRINT_OK)
-  {
-    fingerprintSensorDetails = "Error creating model";
-    return;
-  }
-
-  p = finger.storeModel(index);
-  if (p == FINGERPRINT_OK)
-  {
-    fingerprintSensorDetails = "Fingerprint stored";
-    sendFingerprintId(index, "enroll_confirm");
-  }
-  else
-  {
-    fingerprintSensorDetails = "Error storing fingerprint";
-  }
-  fingerprintSensorisWorking = false;
 }
