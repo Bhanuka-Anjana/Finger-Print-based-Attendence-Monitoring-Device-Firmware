@@ -25,12 +25,12 @@ volatile int selectedMenuOption = 0;
 const int menuControlBtn = 12;
 const int menuItemSelectBtn = 13;
 // array for menu items
-const char *menuItems[] = {"connect server", "mark attendance", " "};
+const char *menuItems[] = {"connect server", "mark attendance", ""};
 
 // WiFi settings
 const char *ssid = "GalaxyA5150E4";
 const char *password = "Password";
-const char *websockets_server_host = "192.168.103.135";
+const char *websockets_server_host = "192.168.203.135";
 const uint16_t websockets_server_port = 8080;
 
 WebServer server(80);
@@ -46,19 +46,18 @@ void taskUpdateBatteryCellData(void *parameter);
 void taskDisplayUpdate(void *parameter);
 void taskStartWebSocketClient(void *parameter);
 void taskMarkAttendance(void *parameter);
+void enrollFingerPrint(void *parameter);
 void menuControlInterrupt();
 void menuSelectInterrupt();
 void webSocketEvent(WStype_t type, uint8_t *payload, size_t length);
-void sendFingerprintId(uint16_t id, const char *action);
+void sendFingerprintId(int id, const char *action);
 
 // Task handles
-TaskHandle_t taskHandleCellPercentage;
 TaskHandle_t taskHandleStartWebSocketServer;
 TaskHandle_t taskHandleMarkAttendance;
 
 void setup()
 {
-
   // Initialize I2C communication
   Wire.begin();
 
@@ -68,40 +67,16 @@ void setup()
   // configure the pin modes
   pinMode(menuControlBtn, INPUT_PULLUP);
   pinMode(menuItemSelectBtn, INPUT_PULLUP);
+  pinMode(23, OUTPUT);
 
   attachInterrupt(digitalPinToInterrupt(menuControlBtn), menuControlInterrupt, FALLING);
   attachInterrupt(digitalPinToInterrupt(menuItemSelectBtn), menuSelectInterrupt, FALLING);
 
-  // Initialize Fuel Gauge
-  // lipo.enableDebugging();
-  if (lipo.begin() == false)
-  {
-    // Serial.println("MAX17043 not detected. Freezing...");
-    while (1)
-      ;
-  }
-
-  lipo.quickStart();
-  lipo.setThreshold(20);
-
-  // Initialize OLED display
-  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
-  {
-    // Serial.println(F("SSD1306 allocation failed"));
-    for (;;)
-      ;
-  }
-  finger.begin(57600);
-
-  display.clearDisplay();
-
   WiFi.begin(ssid, password);
 
   // Create tasks
-  xTaskCreate(taskUpdateBatteryCellData, "CellPercentage", 2048, NULL, 2, &taskHandleCellPercentage);
+  xTaskCreate(taskUpdateBatteryCellData, "CellPercentage", 2048, NULL, 2, NULL);
   xTaskCreate(taskDisplayUpdate, "DisplayUpdate", 2048, NULL, 2, NULL);
-  // xTaskCreatePinnedToCore(taskEnableAPMode, "EnableAPMode", 4096, NULL, 2, &taskHandleEnableAPMode, CONFIG_ARDUINO_RUNNING_CORE);
-  vTaskStartScheduler();
 }
 
 void loop()
@@ -111,10 +86,20 @@ void loop()
 
 void taskUpdateBatteryCellData(void *parameter)
 {
+  // Initialize Fuel Gauge
+  // lipo.enableDebugging();
+  if (lipo.begin() == false)
+  {
+    // Serial.println("MAX17043 not detected. Freezing...");
+    while (1)
+      ;
+  }
+  lipo.setThreshold(20);
+
   while (true)
   {
     // Read battery percentage from MAX17043
-    lipo.wake();
+    lipo.quickStart();
     vTaskDelay(1000 / portTICK_PERIOD_MS);
     cellPercentage = lipo.getSOC();
     lowBattery = lipo.getAlert();
@@ -125,12 +110,21 @@ void taskUpdateBatteryCellData(void *parameter)
 
 void taskDisplayUpdate(void *parameter)
 {
+  // Initialize OLED display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C))
+  {
+    // Serial.println(F("SSD1306 allocation failed"));
+    for (;;)
+      ;
+  }
+
+  display.clearDisplay();
   while (true)
   {
     display.clearDisplay();
 
     display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
+    display.setTextColor(WHITE);
     display.setCursor(0, 0);
     if (WiFi.status() == WL_CONNECTED)
     {
@@ -144,7 +138,7 @@ void taskDisplayUpdate(void *parameter)
     display.print(cellPercentage);
     display.print("%");
 
-    display.setCursor(0, 10);
+    display.setCursor(0, 8);
     for (int i = 0; i < 3; i++)
     {
       if (selectedMenuOption == i)
@@ -153,11 +147,17 @@ void taskDisplayUpdate(void *parameter)
       }
       else
       {
-        display.print(" ");
+        display.print("");
+      }
+      if (i == 2)
+      {
+        // inverse the color of the last item
+        display.setTextColor(BLACK, WHITE);
       }
       display.println(menuItems[i]);
     }
 
+    vTaskDelay(100 / portTICK_PERIOD_MS);
     display.display();
   }
 }
@@ -186,7 +186,12 @@ void taskStartWebSocketClient(void *parameter)
       webSocket.disconnect();
       webSocketConnected = false;
       menuItems[0] = "connect server";
-      break;
+
+      // Turn off the finger print sensor
+      digitalWrite(23, LOW);
+
+      // delete task itself
+      vTaskDelete(NULL);
     }
     webSocket.loop();
   }
@@ -204,6 +209,9 @@ void menuSelectInterrupt()
 
       webSocketConnected = false;
       menuItems[0] = "connect server";
+
+      // Turn off the finger print sensor
+      digitalWrite(23, LOW);
     }
     else
     {
@@ -217,7 +225,11 @@ void menuSelectInterrupt()
     {
       vTaskDelete(taskHandleMarkAttendance);
       menuItems[1] = "mark attendance";
+      menuItems[2] = "";
       fingerprintSensorisWorking = false;
+
+      // Turn off the finger print sensor
+      digitalWrite(23, LOW);
     }
     else
     {
@@ -239,42 +251,8 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
     if (strcmp(action, "enroll") == 0)
     {
       int id = doc["id"];
-      // convert id to char array and assign into menuItems[2]
-      char buffer[10];
-      sprintf(buffer, "%d", id);
-      menuItems[2] = strdup(buffer);
-      while (true)
-      {
-        fingerprintSensorisWorking = true;
-        menuItems[1] = "stop enrollment";
-
-        int p = finger.getImage();
-        if (p == FINGERPRINT_OK)
-        {
-          p = finger.image2Tz();
-          if (p == FINGERPRINT_OK)
-          {
-            p = finger.createModel();
-            if (p == FINGERPRINT_OK)
-            {
-              p = finger.storeModel(id);
-              if (p == FINGERPRINT_OK)
-              {
-                sendFingerprintId(id, "enroll_confirm");
-                menuItems[1] = "mark attendance";
-                menuItems[2] = " ";
-                fingerprintSensorisWorking = false;
-                break;
-              }
-              else
-              {
-                continue;
-              }
-            }
-          }
-        }
-        vTaskDelay(50 / portTICK_PERIOD_MS);
-      }
+      fingerprintSensorisWorking = true;
+      xTaskCreate(enrollFingerPrint, "EnrollFingerPrint", 8192, (void *)id, 2, NULL);
     }
     break;
   }
@@ -286,31 +264,50 @@ void webSocketEvent(WStype_t type, uint8_t *payload, size_t length)
 
 void taskMarkAttendance(void *parameter)
 {
+  if (!webSocketConnected)
+  {
+    menuItems[2] = "Connect to server";
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+    menuItems[2] = "";
+    vTaskDelete(NULL);
+  }
+
+  // Turn on the finger print sensor
+  digitalWrite(23, HIGH);
+  finger.begin(57600);
+  vTaskDelay(100 / portTICK_PERIOD_MS);
+
   while (true)
   {
     fingerprintSensorisWorking = true;
     menuItems[1] = "stop attendance";
+    menuItems[2] = "Place finger";
     int p = finger.getImage();
     if (p == FINGERPRINT_OK)
     {
       p = finger.image2Tz();
+
       if (p == FINGERPRINT_OK)
       {
+        menuItems[2] = "Image taken";
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
         p = finger.fingerFastSearch();
         if (p == FINGERPRINT_OK)
         {
-          if (finger.confidence > 100)
+          if (finger.confidence > 70)
           {
+            menuItems[2] = "Marked!";
             sendFingerprintId((int)finger.fingerID, "attendance");
           }
           else
           {
-            continue;
+            menuItems[2] = "No match";
           }
+          vTaskDelay(2000 / portTICK_PERIOD_MS);
+          continue;
         }
       }
     }
-
     vTaskDelay(50 / portTICK_PERIOD_MS);
   }
 }
@@ -318,8 +315,177 @@ void taskMarkAttendance(void *parameter)
 void sendFingerprintId(int id, const char *action)
 {
   DynamicJsonDocument doc(1024);
-  doc[String(action)] = id;
+  doc["action"] = action;
+  doc["id"] = id;
   String jsonString;
   serializeJson(doc, jsonString);
   webSocket.sendTXT(jsonString);
+}
+
+void enrollFingerPrint(void *parameter)
+{
+  int id = (int)parameter;
+
+  // Turn on the finger print sensor
+  digitalWrite(23, HIGH); 
+  finger.begin(57600);
+  vTaskDelay(100 / portTICK_PERIOD_MS);
+
+  while (true)
+  {
+    int p = -1;
+    while (p != FINGERPRINT_OK)
+    {
+      p = finger.getImage();
+      switch (p)
+      {
+      case FINGERPRINT_OK:
+        menuItems[2] = "Image taken";
+        break;
+      case FINGERPRINT_NOFINGER:
+        menuItems[2] = "No finger";
+        break;
+      case FINGERPRINT_PACKETRECIEVEERR:
+        menuItems[2] = "Communication error";
+        break;
+      case FINGERPRINT_IMAGEFAIL:
+        menuItems[2] = "Imaging error";
+        break;
+      default:
+        menuItems[2] = "Unknown error";
+        break;
+      }
+    }
+
+    p = finger.image2Tz(1);
+    switch (p)
+    {
+    case FINGERPRINT_OK:
+      menuItems[2] = "Image converted";
+      break;
+    case FINGERPRINT_IMAGEMESS:
+      menuItems[2] = "Image too messy";
+      continue;
+      break;
+    case FINGERPRINT_PACKETRECIEVEERR:
+      menuItems[2] = "Communication error";
+      continue;
+      break;
+    case FINGERPRINT_FEATUREFAIL:
+      menuItems[2] = "Could not find fingerprint features";
+      continue;
+      break;
+    case FINGERPRINT_INVALIDIMAGE:
+      menuItems[2] = "Could not find fingerprint features";
+      continue;
+      break;
+    default:
+      menuItems[2] = "Unknown error";
+      continue;
+      break;
+    }
+
+    menuItems[2] = "Remove finger";
+    vTaskDelay(2000 / portTICK_PERIOD_MS);
+
+    p = 0;
+    while (p != FINGERPRINT_NOFINGER)
+    {
+      p = finger.getImage();
+    }
+    p = -1;
+    menuItems[2] = "Place again";
+    while (p != FINGERPRINT_OK)
+    {
+      p = finger.getImage();
+      switch (p)
+      {
+      case FINGERPRINT_OK:
+        menuItems[2] = "Image taken";
+        break;
+      case FINGERPRINT_NOFINGER:
+        menuItems[2] = "No finger";
+        break;
+      case FINGERPRINT_PACKETRECIEVEERR:
+        menuItems[2] = "Communication error";
+        break;
+      case FINGERPRINT_IMAGEFAIL:
+        menuItems[2] = "Imaging error";
+        break;
+      default:
+        menuItems[2] = "Unknown error";
+        break;
+      }
+    }
+
+    // OK success!
+
+    p = finger.image2Tz(2);
+    switch (p)
+    {
+    case FINGERPRINT_OK:
+      menuItems[2] = "Image converted";
+      break;
+    case FINGERPRINT_IMAGEMESS:
+      menuItems[2] = "Image too messy";
+      continue;
+      break;
+    case FINGERPRINT_PACKETRECIEVEERR:
+      menuItems[2] = "Communication error";
+      continue;
+      break;
+    case FINGERPRINT_FEATUREFAIL:
+      menuItems[2] = "Could not find fingerprint features";
+
+      continue;
+      break;
+    case FINGERPRINT_INVALIDIMAGE:
+      menuItems[2] = "Could not find fingerprint features";
+      continue;
+      break;
+    default:
+      menuItems[2] = "Unknown error";
+      continue;
+      break;
+    }
+
+    // OK converted!
+
+    p = finger.createModel();
+    if (p == FINGERPRINT_OK)
+    {
+      menuItems[2] = "Prints matched!";
+    }
+    else
+    {
+      menuItems[2] = "Prints did not match!";
+      continue;
+    }
+
+    p = finger.storeModel(id);
+    if (p == FINGERPRINT_OK)
+    {
+      // Send the fingerprint id to the server
+      sendFingerprintId(id, "enroll_confirm");
+
+      // Turn off the finger print sensor
+      digitalWrite(23, LOW);
+
+      menuItems[2] = "Stored!";
+      fingerprintSensorisWorking = false;
+
+      vTaskDelay(3000 / portTICK_PERIOD_MS);
+
+      menuItems[2] = "";
+
+      // delete task itself
+      vTaskDelete(NULL);
+      break;
+    }
+    else
+    {
+      menuItems[2] = "Failed to store";
+      continue;
+    }
+  }
 }
